@@ -55,3 +55,11 @@ def test_redact_passes_through_scalars_and_lists():
     assert redact("hello") == "hello"
     assert redact(None) is None
     assert redact([1, 2, {"password": "x"}]) == [1, 2, {"password": "***REDACTED***"}]
+
+
+def test_redacts_wxd_spark_credential_by_key_and_by_value():
+    doc = {"configuration": {"spark_conf": {"spark.hadoop.wxd.apiKey": "ZenApiKey abc", "spark.eventLog.enabled": "true"}}, "x": ["ZenApiKey zzz"]}
+    out = redact(doc)
+    assert out["configuration"]["spark_conf"]["spark.hadoop.wxd.apiKey"] == "***REDACTED***"
+    assert out["configuration"]["spark_conf"]["spark.eventLog.enabled"] == "true"
+    assert out["x"] == ["***REDACTED***"]

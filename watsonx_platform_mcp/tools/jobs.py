@@ -23,7 +23,7 @@ from ..bootstrap import ensure_authenticated
 from ..errors import PlatformError
 from ..http import PlatformClient
 from ..pagination import clamp_limit, first_present_list
-from ..utils import extract_id, require_confirm
+from ..utils import extract_id, require_confirm, with_wxd_credentials
 from . import redacted
 
 
@@ -78,11 +78,25 @@ async def create_job(
         Field(default=None, description="Plain cron-expression string, e.g. '0 9 * * *' — confirmed live, NOT an object."),
     ] = None,
     description: Optional[str] = None,
+    inject_wxd_credentials: Annotated[
+        bool,
+        Field(
+            description=(
+                "Spark jobs only (CPD): add the watsonx.data catalog credential to spark_conf "
+                "server-side, from the session's own login. Required for catalog access from a job; "
+                "the value never passes through the caller and is never returned."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Wraps POST /v2/jobs?project_id=... — confirmed live. Request body is
     {"job": {...}}."""
     state = await ensure_authenticated(ctx)
     client = PlatformClient(state)
+    if inject_wxd_credentials:
+        if job_type != "spark_application":
+            raise PlatformError("invalid_request", "inject_wxd_credentials only applies to job_type='spark_application'.", False)
+        configuration = with_wxd_credentials(state, configuration)
 
     job_body: dict[str, Any] = {"name": name, "configuration": configuration if configuration is not None else {}}
     if asset_ref:

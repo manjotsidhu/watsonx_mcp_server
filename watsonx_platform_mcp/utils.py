@@ -51,3 +51,34 @@ def require_confirm(confirm: bool, action: str) -> None:
 def read_local_file(path: str) -> bytes:
     with open(os.path.expanduser(path), "rb") as fh:
         return fh.read()
+
+
+WXD_API_KEY_CONF = "spark.hadoop.wxd.apiKey"
+
+
+def wxd_spark_api_key(state) -> str:
+    """The watsonx.data Spark credential: "ZenApiKey " + base64(username:apikey).
+
+    Built from the session's own credentials so it never passes through the caller.
+    CPD only (needs a username + API key); never log or return the result."""
+    import base64
+
+    from .errors import PlatformError
+
+    if state.environment != "cpd" or not state.username or not state.apikey:
+        raise PlatformError(
+            "invalid_request",
+            "inject_wxd_credentials needs a CPD session authenticated with a username and API key "
+            "(not available for SaaS or username/password sessions).",
+            False,
+        )
+    return "ZenApiKey " + base64.b64encode(f"{state.username}:{state.apikey}".encode()).decode()
+
+
+def with_wxd_credentials(state, configuration: Optional[dict]) -> dict:
+    """Copy of `configuration` with the credential added to spark_conf."""
+    cfg = dict(configuration or {})
+    conf = dict(cfg.get("spark_conf") or {})
+    conf[WXD_API_KEY_CONF] = wxd_spark_api_key(state)
+    cfg["spark_conf"] = conf
+    return cfg

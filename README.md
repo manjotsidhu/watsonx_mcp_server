@@ -114,6 +114,7 @@ provisional pending a live re-verification pass:
 
 - `upload_asset_file` — live-verified on CPD (multipart file PUT, then asset +
   referenced attachment); not tested on SaaS.
+- `run_spark_script`, `delete_asset`, `create_job(inject_wxd_credentials)` — live-verified on CPD (catalog queries not exercised); not tested on SaaS.
 - `get_job_run_logs` — live-verified on CPD (Spark jobs); not tested on SaaS.
 - `update_job` — the JSON-Patch request *format* is confirmed, but two live
   attempts to actually change a job's `schedule` value had no visible effect.

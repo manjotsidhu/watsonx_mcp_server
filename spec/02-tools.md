@@ -504,6 +504,13 @@ DataStage/product-specific job types all flow through one tool.
   operation from `cancel_job_run` if a `delete_job_run`-style tool is added
   later.
 
+### `delete_asset`
+- **in**: `project_id`, `asset_id`, `confirm` (must be true)
+- **out**: `{deleted: true}`
+- **wraps**: `DELETE /v2/assets/{id}?project_id=...` — live-verified on CPD
+  2026-11-08. For a referenced data asset only the record goes; the uploaded
+  object under `/data_asset/<name>` remains.
+
 ## 13. Trigger job runs
 
 ### `create_job_run`
@@ -516,6 +523,34 @@ DataStage/product-specific job types all flow through one tool.
   (i.e. `{"job_run": {...}}`, not `{"run": {...}}` as might otherwise be
   assumed — matches the `{"job": {...}}` wrapper pattern used for jobs
   themselves).
+
+### `run_spark_script` (helper)
+- **in**: `project_id`, `script` (PySpark text), `instance_id`, `engine_id`,
+  `engine_name` (all required — compute is never defaulted), optional
+  `name_prefix`, `spark_version` (default "4.0"), `arguments`, `spark_conf`,
+  `inject_wxd_credentials` (default true)
+- **out**: `{asset_id, job_id, run_id, state, script_name}` — returns
+  immediately; poll `get_job_run`, read `get_job_run_logs`.
+- **does**: `upload_asset_file` (unique name `<prefix>-<8 hex>.py`) →
+  `create_job` (`spark_application`, fresh `upload_id`, same unique name, so
+  no job-name clashes) → `create_job_run`. Failure after upload deletes the
+  job (if created) and asset. On success they are kept (logs live under the
+  job); clean up with `delete_job` / `delete_asset`.
+- **live-verified 2026-11-08 (CPD)**: script printed `HELPER_OK 42`, run
+  `Completed`, return code 0, output found via `get_job_run_logs`.
+
+### Spark credential injection (`create_job.inject_wxd_credentials`)
+Catalog access from a platform job requires `spark_conf`
+`spark.hadoop.wxd.apiKey = "ZenApiKey " + base64(username:apikey)`. With
+`inject_wxd_credentials=true` (spark_application only; also used by
+`run_spark_script`) the server builds it from the session's own CPD
+username + API key and adds it to a copy of `configuration.spark_conf`, so the
+value never passes through the caller. SaaS / no-username sessions get
+`invalid_request`. Redaction masks the key `spark.hadoop.wxd.apiKey` and any
+string value starting `ZenApiKey `; live-verified that `get_job_run` and
+`get_job` show `***REDACTED***`. Limit: the credential is still stored in the
+job config on the platform, visible to anyone with job read access there.
+Catalog access itself (a script querying a catalog) was not exercised live.
 
 ---
 

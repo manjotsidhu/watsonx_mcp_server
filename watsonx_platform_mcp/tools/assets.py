@@ -20,7 +20,7 @@ from ..bootstrap import ensure_authenticated
 from ..errors import PlatformError
 from ..http import PlatformClient
 from ..pagination import clamp_limit, decode_json_cursor, encode_json_cursor
-from ..utils import extract_id, guess_mime_type, read_local_file
+from ..utils import extract_id, guess_mime_type, read_local_file, require_confirm
 from . import redacted
 
 
@@ -120,6 +120,19 @@ async def create_asset(
         "asset_type": asset_type,
         "created_at": (resp.get("metadata") or {}).get("created_at"),
     }
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Delete Asset", destructiveHint=True, idempotentHint=True))
+@redacted
+async def delete_asset(ctx: Context, project_id: str, asset_id: str, confirm: bool = False) -> dict:
+    """DELETE /v2/assets/{id}?project_id=... — live-verified on CPD (used for
+    upload rollback). Removes the asset record; for a referenced data asset the
+    underlying uploaded object is not removed."""
+    require_confirm(confirm, "delete this asset")
+    state = await ensure_authenticated(ctx)
+    client = PlatformClient(state)
+    await client.request("DELETE", f"/v2/assets/{asset_id}", params={"project_id": project_id})
+    return {"deleted": True}
 
 
 def _safe_asset_file_name(name: str) -> str:
