@@ -1,15 +1,15 @@
 """Assets — see spec/02-tools.md #4-6.
 
 list_assets/get_asset/create_asset (generic asset_type case): Phase 1,
-high-confidence, live-verified. upload_asset_file: Phase 3, experimental —
-only the create-data-asset step is confirmed; the
-attachment/signed-URL/complete sequence is unconfirmed.
+high-confidence, live-verified. upload_asset_file: file-first multipart PUT,
+then asset + referenced attachment — live-verified on CPD, untested on SaaS.
 """
 
 from __future__ import annotations
 
 import base64
 from typing import Annotated, Any, Optional
+from urllib.parse import quote
 
 from mcp.server.fastmcp import Context
 from mcp.types import ToolAnnotations
@@ -122,6 +122,27 @@ async def create_asset(
     }
 
 
+def _safe_asset_file_name(name: str) -> str:
+    """The name becomes part of the object key (/data_asset/<name>) and the PUT
+    URL path, so it must be a single plain path segment."""
+    bad = (
+        not name
+        or name != name.strip()
+        or name in (".", "..")
+        or any(c in name for c in "/\\?#%")
+        or any(ord(c) < 32 or ord(c) == 127 for c in name)
+        or len(name) > 200
+    )
+    if bad:
+        raise PlatformError(
+            "invalid_request",
+            "`name` must be a plain file name: no slashes, '?', '#', '%', control characters, "
+            "leading/trailing spaces, or '.'/'..', and at most 200 characters.",
+            False,
+        )
+    return name
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Upload Asset File", destructiveHint=False),
 )
@@ -129,95 +150,86 @@ async def create_asset(
 async def upload_asset_file(
     ctx: Context,
     project_id: str,
-    name: str,
+    name: Annotated[str, Field(description="Plain file name (no slashes); becomes part of the object key /data_asset/<name>.")],
     file_path: Annotated[Optional[str], Field(default=None, description="Local file path. Provide this or content_base64.")] = None,
     content_base64: Annotated[Optional[str], Field(default=None, description="Base64-encoded file content. Provide this or file_path.")] = None,
     mime_type: Optional[str] = None,
     description: Optional[str] = None,
 ) -> dict:
-    """EXPERIMENTAL — Phase 3 / low-confidence (spec/02-tools.md).
+    """Create a data asset holding the given file content.
 
-    Only the create-data-asset step is verified live. The
-    attachment-creation body shape is from a real example request, not
-    independently re-verified. The signed-URL PUT and "complete" steps are
-    entirely unconfirmed — this implementation is a best-effort, defensive
-    sequence that should be re-verified against a live cluster before being
-    relied on. If it fails partway through, the data asset (and possibly a
-    dangling attachment record) may be left behind — this tool does not
-    attempt rollback.
+    Sequence (live-verified on CPD, spec/02-tools.md #6): (1) multipart PUT of
+    the bytes to /v2/asset_files/data_asset/<name>, (2) create the data asset,
+    (3) create a *referenced* attachment pointing at the uploaded object key.
+    If step 2 or 3 fails the asset is deleted (best-effort rollback).
+    SaaS: same sequence, NOT verified live (only CPD was).
+
+    Uploading the same name twice: the object is overwritten and a second,
+    separate asset is created that references the same object key (see spec).
     """
     if not file_path and not content_base64:
         raise PlatformError("invalid_request", "Either file_path or content_base64 is required.", False)
+    name = _safe_asset_file_name(name)
+
+    if file_path:
+        data = read_local_file(file_path)
+    else:
+        try:
+            data = base64.b64decode(content_base64, validate=True)  # type: ignore[arg-type]
+        except (ValueError, TypeError) as exc:
+            raise PlatformError("invalid_request", f"content_base64 is not valid base64: {exc}", False) from exc
 
     state = await ensure_authenticated(ctx)
     client = PlatformClient(state)
-
     mime = mime_type or guess_mime_type(name)
+    params = {"project_id": project_id}
+    object_key = f"/data_asset/{name}"
 
-    # Step 1 (confirmed live): create the data asset.
+    # Step 1: the bytes go first. `object_key` in an attachment means "reference
+    # an existing object", so the object must exist before the attachment does.
+    await client.put_multipart(
+        f"/v2/asset_files/data_asset/{quote(name, safe='')}",
+        file_name=name,
+        content=data,
+        mime_type=mime,
+        params=params,
+    )
+
+    # Step 2: create the data asset.
     create_body = {
         "metadata": {"name": name, "asset_type": "data_asset", "origin_country": "us"},
         "entity": {"data_asset": {"dataset": False, "mime_type": mime}},
     }
     if description is not None:
         create_body["metadata"]["description"] = description
-    asset_resp = await client.request("POST", "/v2/assets", params={"project_id": project_id}, json_body=create_body)
+    asset_resp = await client.request("POST", "/v2/assets", params=params, json_body=create_body)
     asset_resp = asset_resp or {}
-    asset_id = asset_resp.get("asset_id") or extract_id(asset_resp)
+    asset_id = asset_resp.get("asset_id") or (asset_resp.get("metadata") or {}).get("asset_id") or extract_id(asset_resp)
     if not asset_id:
         raise PlatformError("upstream_error", "Asset creation succeeded but no asset_id was returned.", False)
 
-    # Step 2 (from an example request, not independently re-verified live): create the attachment.
-    object_key = f"/data_asset/{name}"
-    attach_body = {
-        "asset_type": "data_asset",
-        "name": "referenced",
-        "description": description or "",
-        "object_key": object_key,
-        "object_key_is_read_only": False,
-        "is_partitioned": False,
-    }
-    attach_resp = await client.request(
-        "POST", f"/v2/assets/{asset_id}/attachments", params={"project_id": project_id}, json_body=attach_body
-    )
-    attach_resp = attach_resp or {}
-    attachment_id = attach_resp.get("attachment_id") or extract_id(attach_resp)
-
-    # Step 3: TODO(spec/02-tools.md, UNCONFIRMED) — whether a signed upload URL is
-    # returned for the file bytes, or the PUT target is derived some other way.
-    # Defensive best-effort: look for a plausible URL field; fall back to PUTting
-    # the attachment endpoint itself.
-    upload_url = attach_resp.get("url") or attach_resp.get("upload_url") or attach_resp.get("signed_url")
-
-    if file_path:
-        data = read_local_file(file_path)
-    else:
-        data = base64.b64decode(content_base64)  # type: ignore[arg-type]
-
-    if upload_url:
-        await client.raw_put(upload_url, data)
-    else:
-        # TODO(spec/02-tools.md, UNCONFIRMED): no signed URL was returned; this
-        # fallback (PUT straight to the attachment endpoint) is not described in
-        # the spec at all and is only a guess pending live re-verification.
-        await client.request(
-            "PUT",
-            f"/v2/assets/{asset_id}/attachments/{attachment_id}",
-            params={"project_id": project_id},
-            json_body=None,
-        )
-
-    # Step 4: TODO(spec/02-tools.md, UNCONFIRMED) — whether a "complete" call is
-    # needed at all. Attempt it defensively; ignore a 404 (endpoint may not exist).
+    # Step 3: referenced attachment. No /complete call is needed in this form.
     try:
-        await client.request(
-            "POST",
-            f"/v2/assets/{asset_id}/attachments/{attachment_id}/complete",
-            params={"project_id": project_id},
-            json_body={},
+        attach_body = {
+            "asset_type": "data_asset",
+            "name": "referenced",
+            "description": description or "",
+            "object_key": object_key,
+            "object_key_is_read_only": False,
+            "is_partitioned": False,
+        }
+        attach_resp = await client.request(
+            "POST", f"/v2/assets/{asset_id}/attachments", params=params, json_body=attach_body
         )
-    except PlatformError as exc:
-        if exc.http_status != 404:
-            raise
+        attach_resp = attach_resp or {}
+        attachment_id = attach_resp.get("attachment_id") or extract_id(attach_resp)
+        if not attachment_id:
+            raise PlatformError("upstream_error", "Attachment creation succeeded but no attachment_id was returned.", False)
+    except BaseException:
+        try:
+            await client.request("DELETE", f"/v2/assets/{asset_id}", params=params)
+        except PlatformError:
+            pass  # rollback is best-effort; surface the original failure
+        raise
 
     return {"asset_id": asset_id, "attachment_id": attachment_id, "name": name}

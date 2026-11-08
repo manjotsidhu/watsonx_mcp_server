@@ -72,18 +72,50 @@ class PlatformClient:
 
         raise normalize_http_error(resp)
 
-    async def raw_put(self, url: str, content: bytes) -> httpx.Response:
-        """PUT raw bytes to an arbitrary (e.g. signed) URL — used by upload_asset_file.
+    async def put_multipart(
+        self,
+        path: str,
+        *,
+        file_name: str,
+        content: bytes,
+        mime_type: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """PUT a file as multipart/form-data (single part named `file`) with the
+        session's auth headers — used by upload_asset_file.
 
-        Honors the session's TLS settings too, since a signed upload URL on a
-        CPD cluster is typically still served from that same cluster."""
+        Live-verified on CPD: /v2/asset_files/... rejects a raw-bytes PUT
+        ("Invalid content type") and needs the multipart form plus the same
+        auth header as every other call. Honors the session's TLS settings."""
+        headers = self._headers()
+        url = self.state.base_url.rstrip("/") + path  # type: ignore[union-attr]
         try:
             async with httpx.AsyncClient(timeout=60.0, verify=self.state.verify_param()) as client:
-                resp = await client.put(url, content=content)
+                resp = await client.put(
+                    url, params=params, headers=headers, files={"file": (file_name, content, mime_type)}
+                )
         except httpx.TimeoutException as exc:
             raise PlatformError("network_error", f"Upload PUT timed out: {exc}", True) from exc
         except httpx.TransportError as exc:
             raise PlatformError("network_error", f"Network error during upload PUT: {exc}", True) from exc
         if not resp.is_success:
             raise normalize_http_error(resp)
-        return resp
+        try:
+            return resp.json() if resp.content else None
+        except ValueError:
+            return None
+
+    async def get_text(self, path: str, *, params: Optional[dict[str, Any]] = None) -> str:
+        """GET a non-JSON (plain text) resource, e.g. /v2/asset_files/... log files."""
+        headers = self._headers()
+        url = self.state.base_url.rstrip("/") + path  # type: ignore[union-attr]
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=self.state.verify_param()) as client:
+                resp = await client.get(url, params=params, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise PlatformError("network_error", f"Request to {path} timed out: {exc}", True) from exc
+        except httpx.TransportError as exc:
+            raise PlatformError("network_error", f"Network error calling {path}: {exc}", True) from exc
+        if not resp.is_success:
+            raise normalize_http_error(resp)
+        return resp.text

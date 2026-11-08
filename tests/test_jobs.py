@@ -106,3 +106,103 @@ async def test_list_jobs_defensive_envelope_lookup(cpd_zen_state: SessionState, 
     ctx = ctx_factory(cpd_zen_state)
     result = await jobs.list_jobs(ctx, project_id="p1")
     assert result["items"] == [{"job_id": "job-1", "name": "j1", "job_type": "job", "schedule_enabled": True}]
+
+
+# --- get_job_run_logs ---------------------------------------------------------
+
+from watsonx_platform_mcp.tools import job_runs  # noqa: E402
+
+_LOGS_URL = "https://cpd.example.com/v2/jobs/j1/runs/r1/logs"
+_LIST_URL = "https://cpd.example.com/v2/asset_files/spark_jobs/j1/r1/logs/"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_job_run_logs_returns_traceback(cpd_zen_state: SessionState, ctx_factory):
+    lines = ["starting", "Traceback (most recent call last):", '  File "x.py", line 2, in <module>', "ValueError: boom"]
+    route = respx.get(_LOGS_URL).mock(return_value=Response(200, json={"results": lines}))
+    respx.get(_LIST_URL).mock(return_value=Response(404))
+    result = await job_runs.get_job_run_logs(ctx_factory(cpd_zen_state), project_id="p1", job_id="j1", run_id="r1")
+    assert route.calls[0].request.url.params["project_id"] == "p1"
+    assert result == {"lines": lines, "total_lines": 4, "returned_lines": 4, "truncated": False}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_job_run_logs_tail_head_and_all(cpd_zen_state: SessionState, ctx_factory):
+    lines = [f"l{i}" for i in range(10)]
+    respx.get(_LOGS_URL).mock(return_value=Response(200, json={"results": lines}))
+    respx.get(_LIST_URL).mock(return_value=Response(404))
+    ctx = ctx_factory(cpd_zen_state)
+    tail = await job_runs.get_job_run_logs(ctx, project_id="p1", job_id="j1", run_id="r1", max_lines=3)
+    assert tail["lines"] == ["l7", "l8", "l9"] and tail["truncated"] and tail["total_lines"] == 10
+    head = await job_runs.get_job_run_logs(ctx, project_id="p1", job_id="j1", run_id="r1", max_lines=3, tail=False)
+    assert head["lines"] == ["l0", "l1", "l2"] and head["truncated"]
+    everything = await job_runs.get_job_run_logs(ctx, project_id="p1", job_id="j1", run_id="r1", max_lines=0)
+    assert everything["lines"] == lines and not everything["truncated"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_job_run_logs_default_cap_and_empty(cpd_zen_state: SessionState, ctx_factory):
+    respx.get(_LOGS_URL).mock(return_value=Response(200, json={"results": [f"l{i}" for i in range(500)]}))
+    respx.get(_LIST_URL).mock(return_value=Response(404))
+    ctx = ctx_factory(cpd_zen_state)
+    r = await job_runs.get_job_run_logs(ctx, project_id="p1", job_id="j1", run_id="r1")
+    assert r["returned_lines"] == 200 and r["lines"][-1] == "l499" and r["truncated"]
+    respx.get(_LOGS_URL).mock(return_value=Response(200, json={}))
+    r = await job_runs.get_job_run_logs(ctx, project_id="p1", job_id="j1", run_id="r1")
+    assert r == {"lines": [], "total_lines": 0, "returned_lines": 0, "truncated": False}
+
+
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_job_run_logs_appends_driver_stdout_with_traceback(cpd_zen_state: SessionState, ctx_factory):
+    """Live finding (CPD): /logs held only the platform summary for a failed run; the
+    traceback was only in the <id>-stdout file."""
+    respx.get(_LOGS_URL).mock(return_value=Response(200, json={"results": ["WARNING: x", "Application is in FAILED state"]}))
+    respx.get(_LIST_URL).mock(
+        return_value=Response(
+            200,
+            json={
+                "resources": [
+                    {"path": "spark_jobs/j1/r1/logs/abc-stdout", "size": 99},
+                    {"path": "spark_jobs/j1/r1/logs/abc-spark-submit-return-code", "size": 2},
+                    {"path": "spark_jobs/j1/r1/logs/x.worker.Worker-1.out", "size": 9},
+                ]
+            },
+        )
+    )
+    out = respx.get("https://cpd.example.com/v2/asset_files/spark_jobs/j1/r1/logs/abc-stdout").mock(
+        return_value=Response(200, text='WARNING: x\nbefore failure\nTraceback (most recent call last):\n  File "s.py", line 3\nValueError: LIVE_BOOM\n')
+    )
+    result = await job_runs.get_job_run_logs(ctx_factory(cpd_zen_state), project_id="p1", job_id="j1", run_id="r1")
+    assert out.calls[0].request.url.params["project_id"] == "p1"
+    assert result["lines"] == [
+        "WARNING: x",
+        "Application is in FAILED state",
+        "=== abc-stdout ===",
+        "before failure",
+        "Traceback (most recent call last):",
+        '  File "s.py", line 3',
+        "ValueError: LIVE_BOOM",
+    ]
+    # Tail keeps the traceback.
+    tailed = await job_runs.get_job_run_logs(ctx_factory(cpd_zen_state), project_id="p1", job_id="j1", run_id="r1", max_lines=2)
+    assert tailed["lines"][-1] == "ValueError: LIVE_BOOM" and tailed["truncated"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_job_run_logs_skips_driver_files_when_listing_fails_or_duplicates(cpd_zen_state: SessionState, ctx_factory):
+    respx.get(_LOGS_URL).mock(return_value=Response(200, json={"results": ["hello", "boom"]}))
+    respx.get(_LIST_URL).mock(return_value=Response(404, json={"message": "nope"}))
+    r = await job_runs.get_job_run_logs(ctx_factory(cpd_zen_state), project_id="p1", job_id="j1", run_id="r1")
+    assert r["lines"] == ["hello", "boom"]
+
+    respx.get(_LIST_URL).mock(return_value=Response(200, json={"resources": [{"path": "spark_jobs/j1/r1/logs/a-stdout"}]}))
+    respx.get("https://cpd.example.com/v2/asset_files/spark_jobs/j1/r1/logs/a-stdout").mock(return_value=Response(200, text="hello\nboom\n"))
+    r = await job_runs.get_job_run_logs(ctx_factory(cpd_zen_state), project_id="p1", job_id="j1", run_id="r1")
+    assert r["lines"] == ["hello", "boom"]  # endpoint already had the driver output

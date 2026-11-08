@@ -155,11 +155,11 @@ async def test_platform_client_request_honors_ca_bundle_path(cpd_zen_state: Sess
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_raw_put_honors_verify_ssl_false(cpd_zen_state: SessionState, captured_verify_kwargs):
+async def test_put_multipart_honors_verify_ssl_false(cpd_zen_state: SessionState, captured_verify_kwargs):
     cpd_zen_state.verify_ssl = False
-    respx.put("https://cpd.example.com/upload/signed-url").mock(return_value=Response(200))
+    respx.put("https://cpd.example.com/v2/asset_files/data_asset/x.py").mock(return_value=Response(201))
     client = PlatformClient(cpd_zen_state)
-    await client.raw_put("https://cpd.example.com/upload/signed-url", b"data")
+    await client.put_multipart("/v2/asset_files/data_asset/x.py", file_name="x.py", content=b"data", mime_type="text/x-python")
     assert False in captured_verify_kwargs
 
 

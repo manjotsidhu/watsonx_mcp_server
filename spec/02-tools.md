@@ -159,34 +159,61 @@ without a change to this server.
 ## 6. Assets (file upload)
 
 ### `upload_asset_file`
-Creates a data asset and uploads file content to it in one call (the
-underlying API is a create-then-attach-then-upload sequence; this tool
-hides that as one operation since it's the common case — e.g. uploading a
-Python script or a CSV).
+Uploads file content as a data asset in one call (e.g. a Python script or a
+CSV). **Live-verified on CPD 2026-11-08** (`cpd-cpd-instance.apps.wxdev.centralus.aroapp.io`,
+throwaway project, since deleted). SaaS: same sequence assumed, **not tested**.
 
-- **in**: `project_id` (required), `name` (required), `file_path` (local
-  path) or `content_base64`, `mime_type` (optional, inferred from extension
-  if omitted), `description`
+- **in**: `project_id` (required), `name` (required; plain file name — see
+  below), `file_path` (local path) or `content_base64`, `mime_type` (optional,
+  inferred from extension if omitted), `description`
 - **out**: `{asset_id, attachment_id, name}`
-- **wraps**: `POST /v2/assets` (create data asset, with the `data_asset`
-  entity shape above) → `POST /v2/assets/{id}/attachments` → `PUT` to a
-  signed upload URL → `POST /v2/assets/{id}/attachments/{attachment_id}/complete`
-- **attachment creation body — real shape from an example request (not
-  independently re-verified live)**:
-  ```json
-  {"asset_type": "data_asset", "name": "referenced", "description": "...",
-   "object_key": "/data_asset/wordcount2.py",
-   "object_key_is_read_only": false, "is_partitioned": false}
-  ```
-  This confirms the attachment step takes `object_key` (the path within the
-  project's storage) rather than nothing. **What the example does not show**:
-  whether a signed upload URL is returned for the actual file bytes, or
-  whether the PUT target is derived from `object_key` some other way, or
-  whether a separate "complete" call is still needed afterward. The
-  create-attach-upload-complete sequence in the `wraps` line above is still
-  the original assumption, now partially but not fully confirmed — this is
-  the single most important thing to verify live before implementing
-  `upload_asset_file`.
+- **wraps** (file first, then reference it):
+  1. `PUT /v2/asset_files/data_asset/<name>?project_id=...` —
+     `multipart/form-data`, one part named `file` = `(name, bytes, mime)`, plus
+     the session's normal auth header. `201 {"status": "Asset created: The asset
+     was successfully uploaded."}`. A raw-bytes PUT without auth is rejected
+     ("Invalid content type").
+  2. `POST /v2/assets?project_id=...` with
+     `{"metadata": {"name", "asset_type": "data_asset", "origin_country": "us"},
+     "entity": {"data_asset": {"dataset": false, "mime_type": <mime>}}}`
+  3. `POST /v2/assets/{id}/attachments?project_id=...` with
+     `{"asset_type": "data_asset", "name": "referenced", "description": "",
+     "object_key": "/data_asset/<name>", "object_key_is_read_only": false,
+     "is_partitioned": false}` → attachment has `transfer_complete: true`,
+     `is_referenced: true`, `size` == file size; `GET /v2/assets/{id}` shows
+     exactly one attachment. **No `/complete` call is needed.**
+- **Why this order**: `object_key` in an attachment body means "reference an
+  existing object", so sending it before any bytes exist fails with
+  `NGPDL4108E Object does not exist key='/data_asset/<name>'` (the original
+  bug). CPD's attachment response has no absolute/signed URL either — only a
+  relative `url1`.
+- **Do NOT use the "managed attachment" form** (attachment without
+  `object_key`, `PUT` to `url1`, `/complete`): the bytes upload, but the Spark
+  engine then resolves the job's application to `/project_data/assets/null`
+  and fails with `application_file_not_found`.
+- **Rollback**: if step 3 (or reading the attachment id) fails, the data asset
+  is deleted (`DELETE /v2/assets/{id}`, best-effort; the original error is what
+  surfaces). A failed step 1 creates nothing. The uploaded object itself is not
+  removed on rollback.
+- **`name` is sanitized** because it becomes part of the object key and URL
+  path: no `/`, `\`, `?`, `#`, `%`, control characters, leading/trailing
+  spaces, `.`/`..`, max 200 chars → `invalid_request`.
+- **Same name uploaded twice** (live-observed): no error. The file at
+  `/data_asset/<name>` is **overwritten**, and a second, separate data asset
+  with the same name is created referencing the same object key. Both assets
+  therefore point at the latest bytes; callers wanting isolation must use
+  unique names.
+- **End-to-end acceptance (live, CPD)**: upload a `.py` → `create_job`
+  (`job_type="spark_application"`, `configuration` =
+  `{"upload_id": <fresh uuid4>, "application": {"type": "data_asset",
+  "asset_id": <asset id>}, "compute": {"instance_id": "1792053576647076",
+  "engine_id": "spark503", "engine_name": "spark-5"}, "spark_version": "4.0",
+  "spark_conf": {"spark.eventLog.enabled": "true"}, "spark_env": {},
+  "arguments": []}`) → `create_job_run` → `get_job_run` reached `Completed`
+  with `entity.job_run.runtime.return_code == "0"` and
+  `runtime.application_details.application ==
+  "/project_data/assets//data_asset/<name>"`. `upload_id` is required (any new
+  UUID works); job names must be unique per project.
 
 ## 7. Connections
 
@@ -439,11 +466,31 @@ DataStage/product-specific job types all flow through one tool.
 - **in**: `project_id`, `job_id`, `run_id`
 - **out**: full run document (state, logs pointer, results pointer)
 - **wraps**: `GET /v2/jobs/{id}/runs/{run_id}?project_id=...`
-- **related, not independently re-verified but seen in an example
-  request**: `GET /v2/jobs/{id}/runs/{run_id}/logs?project_id=...` for run
-  logs — not one of the 13 capabilities as a separate tool, but worth
-  knowing the endpoint exists if `get_job_run`'s output should include a
-  logs pointer/URL.
+- **live-verified 2026-11-08 (CPD)**: the Spark exit code is at
+  `entity.job_run.runtime.return_code` (string, `"0"` on success) and the
+  resolved script at `entity.job_run.runtime.application_details.application`.
+  Run logs are a separate tool, `get_job_run_logs`.
+
+### `get_job_run_logs`
+- **in**: `project_id`, `job_id`, `run_id`, `max_lines` (default 200; `0` =
+  all), `tail` (default true: keep the last `max_lines` lines)
+- **out**: `{lines[], total_lines, returned_lines, truncated}`; read-only
+- **wraps**: `GET /v2/jobs/{id}/runs/{run_id}/logs?project_id=...` →
+  `{"results": ["<line>", ...]}` (200), then — best effort — the driver
+  stdout/stderr files listed under
+  `GET /v2/asset_files/spark_jobs/{id}/{run_id}/logs/` (`*-stdout`, `*-stderr`;
+  fetched with `GET /v2/asset_files/<path>?project_id=...`), appended after a
+  `=== <file> ===` marker with lines already in the first response skipped.
+- **live-verified 2026-11-08 (CPD)**: for a *failed* script
+  (`print("before failure"); raise ValueError("LIVE_BOOM")`) the `/logs`
+  endpoint returned only the platform summary ("Application is in FAILED state
+  ..."); the script's print output and Python traceback appeared only in the
+  `spark-driver-*-stdout` file. Hence the merge above; with it the tool returns
+  the traceback ending `ValueError: LIVE_BOOM`. On a successful run the
+  `print` output (`LIVE_OK 5`) comes from the same file. The master/worker
+  `.out` files in the listing are deliberately not included. Not tested on SaaS.
+- Output is capped by default so it doesn't flood an LLM context; use the
+  `tail` default for tracebacks.
 
 ### `cancel_job_run`
 - **in**: `project_id`, `job_id`, `run_id`
