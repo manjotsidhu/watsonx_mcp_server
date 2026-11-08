@@ -39,6 +39,31 @@ def _normalize_job(resource: dict) -> dict:
     }
 
 
+_ENCRYPT_PATH = "/wxd/platform/api/v1/spark_application/jobs/_encrypt"
+
+
+async def _encrypt_job(client: PlatformClient, project_id: str, job_body: dict) -> dict:
+    """Have the platform encrypt the sensitive values in a Spark job body.
+
+    POST /wxd/platform/api/v1/spark_application/jobs/_encrypt?project_id=... takes the
+    same {"job": {...}} payload as create job and returns it with credentials encrypted;
+    that returned job is what gets created, and the run decrypts it. Live-verified on CPD.
+    Fails closed: if encryption is unavailable the plaintext credential is NOT sent."""
+    try:
+        resp = await client.request("POST", _ENCRYPT_PATH, params={"project_id": project_id}, json_body={"job": job_body})
+    except PlatformError as exc:
+        raise PlatformError(
+            exc.code,
+            f"Could not encrypt the watsonx.data credential via {_ENCRYPT_PATH} ({exc}); the job was not created.",
+            exc.retryable,
+            exc.http_status,
+        ) from exc
+    encrypted = (resp or {}).get("job") if isinstance(resp, dict) else None
+    if not isinstance(encrypted, dict) or not isinstance(encrypted.get("configuration"), dict):
+        raise PlatformError("upstream_error", "Credential encryption returned an unexpected response; the job was not created.", False)
+    return encrypted
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Create Job", destructiveHint=False))
 @redacted
 async def create_job(
@@ -108,6 +133,9 @@ async def create_job(
         job_body["description"] = description
     if schedule is not None:
         job_body["schedule"] = schedule
+
+    if inject_wxd_credentials:
+        job_body = await _encrypt_job(client, project_id, job_body)
 
     resp = await client.request("POST", "/v2/jobs", params={"project_id": project_id}, json_body={"job": job_body})
     resp = resp or {}

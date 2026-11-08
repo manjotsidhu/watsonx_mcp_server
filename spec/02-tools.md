@@ -544,13 +544,23 @@ Catalog access from a platform job requires `spark_conf`
 `spark.hadoop.wxd.apiKey = "ZenApiKey " + base64(username:apikey)`. With
 `inject_wxd_credentials=true` (spark_application only; also used by
 `run_spark_script`) the server builds it from the session's own CPD
-username + API key and adds it to a copy of `configuration.spark_conf`, so the
-value never passes through the caller. SaaS / no-username sessions get
-`invalid_request`. Redaction masks the key `spark.hadoop.wxd.apiKey` and any
-string value starting `ZenApiKey `; live-verified that `get_job_run` and
-`get_job` show `***REDACTED***`. Limit: the credential is still stored in the
-job config on the platform, visible to anyone with job read access there.
-Catalog access itself (a script querying a catalog) was not exercised live.
+username + API key, so the value never passes through the caller. SaaS /
+no-username sessions get `invalid_request`.
+
+The credential is then **encrypted by the platform before the job is created**:
+`POST /wxd/platform/api/v1/spark_application/jobs/_encrypt?project_id=...` takes
+the same `{"job": {...}}` payload as create job and returns it with the
+sensitive values encrypted (no plaintext or `ZenApiKey` in the response); the
+returned job is what is sent to `POST /v2/jobs`, and the job run decrypts it.
+**Live-verified 2026-11-08 (CPD)**: the stored job document contains no
+plaintext credential, and a run with the encrypted value completed
+(return code 0). The step fails closed: if the encrypt call fails or returns an
+unexpected shape, the job is not created and the plaintext is never sent to
+`/v2/jobs`. Clusters without this endpoint therefore cannot use the flag.
+
+Redaction still masks the key `spark.hadoop.wxd.apiKey` and any string value
+starting `ZenApiKey ` in tool output (defense in depth). Catalog access itself (a
+script querying a catalog with the encrypted credential) was not exercised live.
 
 ---
 
