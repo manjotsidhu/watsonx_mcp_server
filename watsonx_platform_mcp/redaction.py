@@ -32,13 +32,21 @@ _SECRET_KEYS = {
     "client_secret",
     "auth_header",
     "authorization",
+    "spark.hadoop.wxd.apikey",  # watsonx.data Spark credential injected into spark_conf
 }
 
 _REDACTED = "***REDACTED***"
 
 
+_ZEN_PREFIX = "ZenApiKey "
+
+
 def redact(value: Any) -> Any:
-    """Recursively redact known secret-shaped fields from a JSON-able structure."""
+    """Recursively redact known secret-shaped fields from a JSON-able structure.
+
+    Also masks any string *value* that is a ZenApiKey header, wherever it sits."""
+    if isinstance(value, str) and value.startswith(_ZEN_PREFIX):
+        return _REDACTED
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():

@@ -91,38 +91,3 @@ async def test_remove_project_member_requires_confirm(cpd_zen_state: SessionStat
 @pytest.mark.skip(reason="Zero testing was done on the entire project-member capability during spec validation (spec/02-tools.md #9). Every field name and endpoint here is an unverified assumption, including whether `identity` doubles as `{member_id}` in the path — needs a full live pass.")
 def test_project_members_live_endpoint_shapes_pending_verification():
     pass
-
-
-# --- upload_asset_file: only the create-data-asset step is verified --------
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_upload_asset_file_create_step_uses_data_asset_entity_shape(cpd_zen_state: SessionState, ctx_factory, tmp_path):
-    """Only this first step (create_asset with the data_asset entity shape) is
-    confirmed-ish (from an example request) — the rest of this test's mocked chain
-    is this server's own best-effort, unconfirmed sequence."""
-    f = tmp_path / "script.py"
-    f.write_text("print('hi')")
-
-    create_route = respx.post("https://cpd.example.com/v2/assets").mock(return_value=Response(201, json={"asset_id": "a1"}))
-    attach_route = respx.post("https://cpd.example.com/v2/assets/a1/attachments").mock(
-        return_value=Response(201, json={"attachment_id": "att-1"})
-    )
-    respx.put(
-        "https://cpd.example.com/v2/assets/a1/attachments/att-1"
-    ).mock(return_value=Response(200, json={}))
-    respx.post("https://cpd.example.com/v2/assets/a1/attachments/att-1/complete").mock(return_value=Response(404))
-
-    ctx = ctx_factory(cpd_zen_state)
-    result = await assets.upload_asset_file(ctx, project_id="p1", name="script.py", file_path=str(f))
-
-    create_body = json.loads(create_route.calls[0].request.content)
-    assert create_body["entity"]["data_asset"]["mime_type"] == "text/x-python"
-    assert json.loads(attach_route.calls[0].request.content)["object_key"] == "/data_asset/script.py"
-    assert result == {"asset_id": "a1", "attachment_id": "att-1", "name": "script.py"}
-
-
-@pytest.mark.skip(reason="spec/02-tools.md: the attachment->signed-URL->complete sequence beyond asset creation is UNCONFIRMED — no live cluster pass has exercised the real signed-URL PUT step or confirmed a 'complete' call is even required. This server's fallback behavior (PUT to the attachment endpoint, best-effort 'complete' call ignoring 404) is a guess pending live re-verification.")
-def test_upload_asset_file_full_live_sequence_pending_verification():
-    pass

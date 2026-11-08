@@ -112,8 +112,10 @@ speculatively) · `list_connections` · `get_connection` ·
 Implemented from the spec's contract, but treat the exact shapes as
 provisional pending a live re-verification pass:
 
-- `upload_asset_file` — only the create-data-asset step is verified; the
-  attachment/signed-URL/complete sequence is this server's best-effort guess.
+- `upload_asset_file` — live-verified on CPD (multipart file PUT, then asset +
+  referenced attachment); not tested on SaaS.
+- `run_spark_script`, `delete_asset`, `create_job(inject_wxd_credentials)` — live-verified on CPD (catalog queries not exercised); not tested on SaaS.
+- `get_job_run_logs` — live-verified on CPD (Spark jobs); not tested on SaaS.
 - `update_job` — the JSON-Patch request *format* is confirmed, but two live
   attempts to actually change a job's `schedule` value had no visible effect.
 - `list_job_runs`, `get_job_run`, `cancel_job_run`, `create_job_run` — from an
